@@ -14,6 +14,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       ORT_VERSION: "1.28.0"
+      # Match upstream v0.2.12: never tune the common GGML code for the runner CPU.
+      GGML_NATIVE: "OFF"
       GGML_BACKEND_DL: "ON"
       GGML_CPU_ALL_VARIANTS: "ON"
       GGML_AVX2: "OFF"
@@ -22,23 +24,16 @@ jobs:
       GGML_BMI2: "OFF"
 
     steps:
-      - name: Check out the fork
+      # This exact fork snapshot is the source tree used by the successful
+      # Windows build #6 (97.2 MB installer). The patch was authored against
+      # this fork snapshot, not the upstream v0.2.12 tag. Pinning its full SHA
+      # prevents later changes on main from silently breaking patch context.
+      - name: Check out the known-good fork source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: e692a75059fb138dd3505d59d9c749fc4be220fc
 
-      - name: Apply the Auto Captions fixes
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if (-not (Test-Path "Concat-0.2.12-fixes.patch")) {
-            throw "Concat-0.2.12-fixes.patch is missing from the repository root. Upload it there first."
-          }
-          git apply --check Concat-0.2.12-fixes.patch
-          if ($LASTEXITCODE -ne 0) { throw "The patch does not match this source tree. No files were changed." }
-          git apply Concat-0.2.12-fixes.patch
-          if ($LASTEXITCODE -ne 0) { throw "Applying the patch failed." }
-          Write-Host "Patch applied."
-
-      - name: Read the source version
+      - name: Read and verify the source version
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -46,9 +41,41 @@ jobs:
           $match = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^\"]+)"')
           if (-not $match.Success) { throw "Could not read the application version from src/Cargo.toml" }
           $version = $match.Groups[1].Value
-          if ($version -ne "0.2.12") { throw "Expected source version 0.2.12, found $version. Stop rather than build the wrong version." }
+          if ($version -ne "0.2.12") { throw "Expected pinned source version 0.2.12, found $version. Stop rather than build the wrong version." }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Building fixed Concat $version for Windows x86_64."
+          Write-Host "Building patched Concat $version for Windows x86_64."
+
+      - name: Apply and validate the Auto Captions fixes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $patch = "Concat-0.2.12-fixes.patch"
+          if (-not (Test-Path $patch)) { throw "$patch is missing from the repository root." }
+
+          # The published patch has one added documentation line missing its
+          # leading '+' in some copies. Correct that exact line in a temporary
+          # copy; do not silently alter the patch stored in the fork.
+          $patchText = [System.IO.File]::ReadAllText((Resolve-Path $patch))
+          $badLine = 'If VAD has no matching region or its result is not trusted, the previous Whisper timing fallback is retained.'
+          $goodLine = '+' + $badLine
+          if ($patchText.Contains($badLine) -and -not $patchText.Contains($goodLine)) {
+            $patchText = [regex]::Replace(
+              $patchText,
+              '(?m)^' + [regex]::Escape($badLine) + '\r?$',
+              $goodLine
+            )
+          }
+
+          $fixedPatch = Join-Path $env:RUNNER_TEMP "Concat-0.2.12-fixes.fixed.patch"
+          [System.IO.File]::WriteAllText($fixedPatch, $patchText, [System.Text.UTF8Encoding]::new($false))
+
+          git apply --check $fixedPatch
+          if ($LASTEXITCODE -ne 0) { throw "The patch does not match upstream v0.2.12. No source files were changed." }
+          git apply $fixedPatch
+          if ($LASTEXITCODE -ne 0) { throw "Applying the Auto Captions patch failed." }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "The patched source has whitespace errors." }
+          Write-Host "Patch validation and application succeeded."
 
       - name: Install the pinned Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 2026-10-09
@@ -110,8 +137,29 @@ jobs:
           $ErrorActionPreference = "Stop"
           Push-Location src
           try {
+            # GGML_NATIVE changes CMake's CPU code generation. Remove only the
+            # cached whisper-rs-sys CMake build so it is configured again with
+            # GGML_NATIVE=OFF rather than reusing a previous runner-specific build.
+            $whisperBuildRoot = "target\x86_64-pc-windows-msvc\app\build"
+            if (Test-Path -LiteralPath $whisperBuildRoot) {
+              Get-ChildItem -LiteralPath $whisperBuildRoot -Directory -Filter "whisper-rs-sys-*" |
+                ForEach-Object {
+                  Write-Host "Removing cached Whisper/GGML build: $($_.FullName)"
+                  Remove-Item -LiteralPath $_.FullName -Recurse -Force
+                }
+            }
+
             cargo build --profile app -p concat --target x86_64-pc-windows-msvc
             if ($LASTEXITCODE -ne 0) { throw "Cargo build failed with exit code $LASTEXITCODE." }
+
+            # Print the actual CMake options recorded by whisper-rs-sys.
+            $cmakeCaches = Get-ChildItem "target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*" `
+              -Filter "CMakeCache.txt" -File -Recurse -ErrorAction SilentlyContinue
+            foreach ($cache in $cmakeCaches) {
+              Write-Host "GGML configuration in $($cache.FullName):"
+              Select-String -Path $cache.FullName -Pattern '^GGML_(NATIVE|BACKEND_DL|CPU_ALL_VARIANTS|AVX2|FMA|F16C|BMI2):' |
+                ForEach-Object { Write-Host "  $($_.Line)" }
+            }
           }
           finally { Pop-Location }
 
@@ -132,8 +180,24 @@ jobs:
           $built = Get-ChildItem "src\target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $built) { throw "whisper-rs-sys did not produce ggml-cpu-x64.dll." }
-          Copy-Item (Join-Path $built.DirectoryName "whisper.dll") $dir
-          Copy-Item (Join-Path $built.DirectoryName "ggml*.dll") $dir
+          Write-Host "Whisper/GGML build output: $($built.DirectoryName)"
+          $whisperDll = Join-Path $built.DirectoryName "whisper.dll"
+          if (-not (Test-Path $whisperDll)) {
+            throw "whisper.dll is missing from $($built.DirectoryName)."
+          }
+          Copy-Item $whisperDll $dir
+
+          # whisper-rs-sys puts whisper.dll and all ggml*.dll files together
+          # in out\bin. They are not inside an additional 'ggml' directory.
+          $ggmlDlls = @(Get-ChildItem -LiteralPath $built.DirectoryName -Filter "ggml*.dll" -File)
+          if ($ggmlDlls.Count -eq 0) {
+            throw "No ggml*.dll files were found in $($built.DirectoryName)."
+          }
+          $ggmlDlls | ForEach-Object {
+            Write-Host "Staging $($_.Name)"
+            Copy-Item -LiteralPath $_.FullName -Destination $dir -Force
+          }
+
           foreach ($module in "x64", "sandybridge", "haswell") {
             if (-not (Test-Path (Join-Path $dir "ggml-cpu-$module.dll"))) {
               throw "The required ggml-cpu-$module.dll module is missing."
@@ -143,12 +207,54 @@ jobs:
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path $vswhere)) { throw "Visual Studio's vswhere.exe was not found." }
-          $vs = & $vswhere -latest -products * -property installationPath
-          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $crt) { throw "The Visual C++ runtime redistributable folder was not found." }
-          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Host*\*\dumpbin.exe" | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe was not found in Visual Studio Build Tools." }
+          $vsResult = & $vswhere -latest -products * -property installationPath
+          if ($LASTEXITCODE -ne 0) { throw "vswhere failed while locating Visual Studio." }
+          $vs = [string]($vsResult | Select-Object -First 1)
+          $vs = $vs.Trim()
+          if (-not $vs -or -not (Test-Path -LiteralPath $vs)) { throw "vswhere could not locate the Visual Studio installation." }
+          Write-Host "Visual Studio installation: $vs"
+
+          # VS 2022 stores the x64 runtime here:
+          # VC\Redist\MSVC\<version>\x64\Microsoft.VC143.CRT
+          # Do not look for a Microsoft.VC14\*.CRT nested path: that folder
+          # name does not exist in the current VS 2022 layout.
+          $redistRoot = Join-Path $vs "VC\Redist\MSVC"
+          if (-not (Test-Path -LiteralPath $redistRoot)) {
+            throw "The Visual C++ redist root was not found: $redistRoot"
+          }
+          $crtCandidates = @(
+            Get-ChildItem -LiteralPath $redistRoot -Directory -Recurse -ErrorAction Stop |
+              Where-Object {
+                $_.Name -match '^Microsoft\.VC\d+\.CRT$' -and
+                $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT$'
+              }
+          )
+          if ($crtCandidates.Count -eq 0) {
+            $found = Get-ChildItem -LiteralPath $redistRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^Microsoft\.VC.*\.CRT$' } |
+              Select-Object -ExpandProperty FullName
+            Write-Host "CRT directories found under redist root:"
+            $found | ForEach-Object { Write-Host "  $_" }
+            throw "The x64 Visual C++ CRT folder (for example Microsoft.VC143.CRT) was not found under $redistRoot."
+          }
+          $crt = $crtCandidates |
+            Sort-Object -Property @{ Expression = {
+              $versionFolder = Split-Path (Split-Path $_.FullName -Parent) -Leaf
+              try { [version]$versionFolder } catch { [version]'0.0' }
+            } } -Descending |
+            Select-Object -First 1
+          Write-Host "Using Visual C++ runtime folder: $($crt.FullName)"
+
+          # Locate the x64-hosted x64 dumpbin from the installed MSVC toolset.
+          $msvcTools = Join-Path $vs "VC\Tools\MSVC"
+          if (-not (Test-Path -LiteralPath $msvcTools)) { throw "MSVC tools folder was not found: $msvcTools" }
+          $dumpbinItem = Get-ChildItem -LiteralPath $msvcTools -Filter "dumpbin.exe" -File -Recurse -ErrorAction Stop |
+            Where-Object { $_.FullName -match '\\bin\\Hostx64\\x64\\dumpbin\.exe$' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $dumpbinItem) { throw "x64 dumpbin.exe was not found under $msvcTools." }
+          $dumpbin = $dumpbinItem.FullName
+          Write-Host "Using dumpbin: $dumpbin"
 
           # Include the Visual C++ runtime DLLs imported by the app and its DLLs.
           foreach ($pass in 1, 2) {
